@@ -49,6 +49,12 @@ const krakenRadius = 25;
 const krakenAttackRadius = 62;
 const krakenSpeed = 1;
 const krakenAttackDamage = 2980;
+const krakenProjectileHitboxes = Object.freeze([
+  { x: 0, y: 2.2, z: -6.85, rx: 5.55, ry: 2.95, rz: 2.82 },
+  { x: 0, y: 1.28, z: -5.72, rx: 6.28, ry: 1.18, rz: 2.18 },
+  { x: 0, y: 2.7, z: -4.25, rx: 5.85, ry: 2.75, rz: 1.65 },
+  { x: 0, y: 1.16, z: -8.82, rx: 1.95, ry: 0.86, rz: 0.86 },
+]);
 const krakenBotFleeRadius = krakenAttackRadius + 46;
 const crateDropMultiplier = 1.2;
 const balloonBombDamage = 640;
@@ -3005,9 +3011,9 @@ function updateKraken(now, dt) {
     kraken.targetX = target.x;
     kraken.targetZ = target.z;
   } else {
-    const desiredRotation = Math.atan2(toTarget.x, toTarget.z);
+    const desiredRotation = Math.atan2(-toTarget.x, -toTarget.z);
     kraken.rotation += clamp(angleDelta(desiredRotation, kraken.rotation), -0.28 * dt, 0.28 * dt);
-    const forward = { x: Math.sin(kraken.rotation), z: Math.cos(kraken.rotation) };
+    const forward = { x: -Math.sin(kraken.rotation), z: -Math.cos(kraken.rotation) };
     kraken.vx += (forward.x * krakenSpeed - kraken.vx) * clamp(dt * 0.45, 0, 0.08);
     kraken.vz += (forward.z * krakenSpeed - kraken.vz) * clamp(dt * 0.45, 0, 0.08);
     kraken.vx *= 0.992;
@@ -3664,7 +3670,7 @@ function updateWorld() {
             damageBot(shotTarget.bot, damage);
             shotTarget.bot.targetBot = bot.id;
             shotTarget.bot.botFightUntil = now + 9000;
-          } else if (shotTarget.kraken) {
+          } else if (false && shotTarget.kraken) {
             krakenDamage += damage * 0.45;
           }
         }
@@ -3872,6 +3878,127 @@ function normalizedShot(ownerId, shot, sentAt) {
   };
 }
 
+function krakenWorldToLocalPoint(x, y, z) {
+  const dx = x - kraken.x;
+  const dz = z - kraken.z;
+  const cos = Math.cos(kraken.rotation || 0);
+  const sin = Math.sin(kraken.rotation || 0);
+  return {
+    x: dx * cos - dz * sin,
+    y,
+    z: dx * sin + dz * cos,
+  };
+}
+
+function krakenLocalSegmentHitboxEntry(startLocal, endLocal, hitbox) {
+  const sx = (startLocal.x - hitbox.x) / hitbox.rx;
+  const sy = (startLocal.y - hitbox.y) / hitbox.ry;
+  const sz = (startLocal.z - hitbox.z) / hitbox.rz;
+  const ex = (endLocal.x - hitbox.x) / hitbox.rx;
+  const ey = (endLocal.y - hitbox.y) / hitbox.ry;
+  const ez = (endLocal.z - hitbox.z) / hitbox.rz;
+  const dx = ex - sx;
+  const dy = ey - sy;
+  const dz = ez - sz;
+  const c = sx * sx + sy * sy + sz * sz - 1;
+  if (c <= 0) return 0;
+  const a = dx * dx + dy * dy + dz * dz;
+  if (a <= 0.000001) return null;
+  const b = 2 * (sx * dx + sy * dy + sz * dz);
+  const discriminant = b * b - 4 * a * c;
+  if (discriminant < 0) return null;
+  const root = Math.sqrt(discriminant);
+  const first = (-b - root) / (2 * a);
+  const second = (-b + root) / (2 * a);
+  if (first >= 0 && first <= 1) return first;
+  if (second >= 0 && second <= 1) return second;
+  return null;
+}
+
+function krakenLocalShotEntry(startLocal, endLocal) {
+  let entry = null;
+  for (const hitbox of krakenProjectileHitboxes) {
+    const t = krakenLocalSegmentHitboxEntry(startLocal, endLocal, hitbox);
+    if (t !== null && (entry === null || t < entry)) entry = t;
+  }
+  return entry;
+}
+
+function krakenShotHeadCollision(shot) {
+  if (!kraken?.alive || !shot || shot.ammoType === "airburst") return null;
+  const startX = Number(shot.x);
+  const startZ = Number(shot.z);
+  const startY = Number.isFinite(Number(shot.startY)) ? Number(shot.startY) : Number.isFinite(Number(shot.y)) ? Number(shot.y) : 1.15;
+  let dirX = Number(shot.dirX);
+  let dirZ = Number(shot.dirZ);
+  if (![startX, startY, startZ, dirX, dirZ].every(Number.isFinite)) return null;
+  const dirLength = Math.hypot(dirX, dirZ);
+  if (dirLength < 0.001) return null;
+  dirX /= dirLength;
+  dirZ /= dirLength;
+  const targetDistance = Math.hypot(Number(shot.targetX) - startX, Number(shot.targetZ) - startZ);
+  const range = clamp(Number(shot.range) || targetDistance || botCannonRange, 1, 420);
+  const shotSpeed = cannonballSpeed * (shot.ammoType === "rocketburst" ? 1.5 : 1);
+  const gravity = Number.isFinite(Number(shot.gravity)) ? Number(shot.gravity) : 5.2;
+  const verticalVelocity = Number.isFinite(Number(shot.verticalVelocity)) ? Number(shot.verticalVelocity) : 0;
+  const ballistic = shot.ballistic !== false;
+  const steps = Math.max(12, Math.min(120, Math.ceil(range / 1.15)));
+  let previous = null;
+  for (let i = 0; i <= steps; i++) {
+    const traveled = (range * i) / steps;
+    const x = startX + dirX * traveled;
+    const z = startZ + dirZ * traveled;
+    const progress = clamp(traveled / Math.max(1, range), 0, 1);
+    const flightTime = traveled / Math.max(0.001, shotSpeed);
+    const y = ballistic
+      ? startY + verticalVelocity * flightTime - 0.5 * gravity * flightTime * flightTime
+      : 1.05 + Math.sin(progress * Math.PI) * clamp(range * 0.16, 3.2, 10.5);
+    const local = krakenWorldToLocalPoint(x, y, z);
+    if (previous) {
+      const entry = krakenLocalShotEntry(previous.local, local);
+      if (entry !== null) {
+        return {
+          x: previous.x + (x - previous.x) * entry,
+          y: previous.y + (y - previous.y) * entry,
+          z: previous.z + (z - previous.z) * entry,
+          distance: previous.distance + (traveled - previous.distance) * entry,
+        };
+      }
+    } else if (krakenLocalShotEntry(local, local) !== null) {
+      return { x, y, z, distance: traveled };
+    }
+    previous = { x, y, z, distance: traveled, local };
+  }
+  return null;
+}
+
+function applyKrakenShotHits(ownerId, shots) {
+  if (!kraken?.alive || !Array.isArray(shots) || !shots.length) return false;
+  const ownerSocket = clients.get(ownerId) || null;
+  let changed = false;
+  for (const shot of shots) {
+    const hit = krakenShotHeadCollision(shot);
+    if (!hit) continue;
+    shot.krakenHit = true;
+    const baseDamage = Number(shot.baseDamage ?? shot.damage) || 0;
+    const damage = scaleDamageByRange(baseDamage, hit.distance, Number(shot.range) || hit.distance || 1);
+    damageKraken(damage, ownerSocket, { allowRemote: true });
+    changed = true;
+    broadcast({
+      type: "projectileImpact",
+      id: shot.id,
+      impact: "hit",
+      targetKind: "kraken",
+      ammoType: shot.ammoType || "basic",
+      x: hit.x,
+      y: hit.y,
+      z: hit.z,
+      sentAt: Date.now(),
+    });
+  }
+  return changed;
+}
+
 function queueShotBroadcasts(ownerId, shots) {
   for (const client of clients.values()) {
     if (client.id === ownerId) continue;
@@ -3913,7 +4040,9 @@ function broadcastShotsFrom(ownerId, shots) {
     .filter(Boolean)
     .map((shot) => normalizedShot(ownerId, shot, now));
   if (!list.length) return;
+  const krakenChanged = applyKrakenShotHits(ownerId, list);
   queueShotBroadcasts(ownerId, list);
+  if (krakenChanged) broadcast(worldSnapshot());
 }
 
 function broadcastShotFrom(ownerId, shot) {

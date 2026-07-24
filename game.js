@@ -24,6 +24,16 @@ const scratchV1 = new THREE.Vector3();
 const scratchV2 = new THREE.Vector3();
 const scratchV3 = new THREE.Vector3();
 const projectileHitLocal = new THREE.Vector3();
+const projectilePreviousWorld = new THREE.Vector3();
+const krakenSweepStart = new THREE.Vector3();
+const krakenSweepEnd = new THREE.Vector3();
+const krakenSweepHitWorld = new THREE.Vector3();
+const KRAKEN_PROJECTILE_HITBOXES = Object.freeze([
+  { x: 0, y: 2.2, z: -6.85, rx: 5.55, ry: 2.95, rz: 2.82 },
+  { x: 0, y: 1.28, z: -5.72, rx: 6.28, ry: 1.18, rz: 2.18 },
+  { x: 0, y: 2.7, z: -4.25, rx: 5.85, ry: 2.75, rz: 1.65 },
+  { x: 0, y: 1.16, z: -8.82, rx: 1.95, ry: 0.86, rz: 0.86 },
+]);
 
 const ui = {
   playerName: document.querySelector("#playerName"),
@@ -5696,6 +5706,31 @@ function islandFootprintContains(island, point, margin = 0) {
   return dist2(point, island.group.position) <= island.radius + margin;
 }
 
+function islandDockPointRadius(island) {
+  if (!island) return 0;
+  const shipPadding = state.mode === "ship" ? shipCollisionRadius(state.shipType) * 0.35 : 0;
+  if (island.exploreOnly) return clamp(island.radius * 0.22 + shipPadding, 5.5, 11.5);
+  return state.mode === "ship" ? 18 : 16;
+}
+
+function islandDockShoreMargin(island) {
+  if (!island) return 0;
+  if (island.exploreOnly) {
+    const shipPadding = state.mode === "ship" ? shipCollisionRadius(state.shipType) * 0.52 : 0;
+    return state.mode === "ship"
+      ? clamp(island.radius * 0.08 + shipPadding + 2.2, 4.2, 10.5)
+      : 1.8;
+  }
+  return state.mode === "ship" ? 12 : 2;
+}
+
+function islandDockContains(island, point) {
+  if (!island || !point) return false;
+  if (dist2(point, island.dock) < islandDockPointRadius(island)) return true;
+  if (island.surfaceLobes?.length) return islandFootprintContains(island, point, islandDockShoreMargin(island));
+  return dist2(point, island.group.position) < island.radius + islandDockShoreMargin(island);
+}
+
 function addBuildingMeshPart(group, mesh) {
   mesh.castShadow = true;
   mesh.receiveShadow = true;
@@ -10473,7 +10508,10 @@ function syncKraken(data) {
   krakenBoss.group.position.z = Number(data.z) || 0;
   const moved = krakenBoss.group.position.clone().sub(lastPosition);
   moved.y = 0;
-  krakenBoss.group.rotation.y = moved.lengthSq() > 0.0025 ? Math.atan2(moved.x, moved.z) : Number(data.rotation) || 0;
+  const serverRotation = Number(data.rotation);
+  krakenBoss.group.rotation.y = Number.isFinite(serverRotation)
+    ? serverRotation
+    : moved.lengthSq() > 0.0025 ? Math.atan2(-moved.x, -moved.z) : 0;
   if (krakenBoss.alive) {
     krakenBoss.group.visible = true;
     krakenBoss.group.position.y = Math.sin(clock.elapsedTime * 0.6) * 0.18;
@@ -10484,14 +10522,48 @@ function syncKraken(data) {
   }
 }
 
-function projectileHitsKraken(shot) {
-  if (!krakenBoss?.alive || !krakenBoss.group) return false;
-  const localPoint = krakenBoss.group.worldToLocal(shot.mesh.position.clone());
-  const headCenter = new THREE.Vector3(0, 2.75, -6.55);
-  const dx = (localPoint.x - headCenter.x) / 5.8;
-  const dy = (localPoint.y - headCenter.y) / 4.5;
-  const dz = (localPoint.z - headCenter.z) / 4.0;
-  return dx * dx + dy * dy + dz * dz <= 1 && shot.mesh.position.y < 12;
+function krakenSegmentHitboxEntry(startLocal, endLocal, hitbox) {
+  const sx = (startLocal.x - hitbox.x) / hitbox.rx;
+  const sy = (startLocal.y - hitbox.y) / hitbox.ry;
+  const sz = (startLocal.z - hitbox.z) / hitbox.rz;
+  const ex = (endLocal.x - hitbox.x) / hitbox.rx;
+  const ey = (endLocal.y - hitbox.y) / hitbox.ry;
+  const ez = (endLocal.z - hitbox.z) / hitbox.rz;
+  const dx = ex - sx;
+  const dy = ey - sy;
+  const dz = ez - sz;
+  const c = sx * sx + sy * sy + sz * sz - 1;
+  if (c <= 0) return 0;
+  const a = dx * dx + dy * dy + dz * dz;
+  if (a <= 0.000001) return null;
+  const b = 2 * (sx * dx + sy * dy + sz * dz);
+  const discriminant = b * b - 4 * a * c;
+  if (discriminant < 0) return null;
+  const root = Math.sqrt(discriminant);
+  const first = (-b - root) / (2 * a);
+  const second = (-b + root) / (2 * a);
+  if (first >= 0 && first <= 1) return first;
+  if (second >= 0 && second <= 1) return second;
+  return null;
+}
+
+function projectileHitsKraken(shot, previousWorld = null) {
+  if (!krakenBoss?.alive || !krakenBoss.group || !shot?.mesh) return false;
+  const startWorld = previousWorld || shot.mesh.position;
+  const endWorld = shot.mesh.position;
+  const startLocal = krakenBoss.group.worldToLocal(krakenSweepStart.copy(startWorld));
+  const endLocal = krakenBoss.group.worldToLocal(krakenSweepEnd.copy(endWorld));
+  let entry = null;
+  KRAKEN_PROJECTILE_HITBOXES.forEach((hitbox) => {
+    const t = krakenSegmentHitboxEntry(startLocal, endLocal, hitbox);
+    if (t !== null && (entry === null || t < entry)) entry = t;
+  });
+  if (entry === null) return false;
+  if (previousWorld && entry > 0 && entry < 1) {
+    krakenSweepHitWorld.copy(previousWorld).lerp(endWorld, entry);
+    shot.mesh.position.copy(krakenSweepHitWorld);
+  }
+  return true;
 }
 
 function submergeKrakenTentacleNear(worldPoint) {
@@ -12475,11 +12547,7 @@ function currentIsland() {
   }
   return islands.find((island) => {
     if (state.mode === "ship" && island.forge) return false;
-    const dockDistance = dist2(pos, island.dock);
-    const islandDistance = dist2(pos, island.group.position);
-    return state.mode === "ship"
-      ? dockDistance < 18 || islandDistance < island.radius + 12
-      : dockDistance < 16 || islandDistance < island.radius + 2;
+    return islandDockContains(island, pos);
   });
 }
 
@@ -14291,6 +14359,7 @@ function updateProjectiles(dt) {
       removeProjectile(shot);
       continue;
     }
+    const previousPosition = projectilePreviousWorld.copy(shot.mesh.position);
     shot.traveled += shot.speed * dt;
     const progress = clamp(shot.traveled / shot.distance, 0, 1);
     if (shot.ballistic) {
@@ -14385,10 +14454,9 @@ function updateProjectiles(dt) {
             hit = true;
           }
         });
-        if (!hit && projectileHitsKraken(shot)) {
+        if (!hit && projectileHitsKraken(shot, previousPosition)) {
           const impactDamage = projectileDamageAtImpact(shot);
-          if (multiplayer.serverWorld) sendMultiplayer({ type: "hitKraken", damage: impactDamage });
-          krakenBoss.hp = Math.max(0, (krakenBoss.hp || 0) - impactDamage);
+          if (!multiplayer.serverWorld) krakenBoss.hp = Math.max(0, (krakenBoss.hp || 0) - impactDamage);
           hit = true;
         }
       }
@@ -14419,6 +14487,9 @@ function updateProjectiles(dt) {
             hit = true;
           }
         });
+      }
+      if (!hit && shot.ammoType !== "airburst" && projectileHitsKraken(shot, previousPosition)) {
+        hit = true;
       }
     }
     if (progress >= 1 || hit) {
@@ -16195,6 +16266,7 @@ function applyServerProjectileImpact(message) {
     Number.isFinite(Number(message.z)) ? Number(message.z) : shot?.mesh.position.z || 0
   );
   if (!shot) {
+    if (message.targetKind === "kraken") return;
     if (message.impact === "hit") {
       const dir = new THREE.Vector3(1, 0, 0);
       if (message.ammoType === "hotshot" || message.ammoType === "rocketburst") makeFireImpactEffect(impactPosition, dir);
