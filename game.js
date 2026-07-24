@@ -5706,6 +5706,41 @@ function islandFootprintContains(island, point, margin = 0) {
   return dist2(point, island.group.position) <= island.radius + margin;
 }
 
+function islandShipContactMargin(shipType = state.shipType, padding = 4) {
+  return shipCollisionRadius(shipType) * 0.62 + padding;
+}
+
+function islandLobePushout(island, lobe, point, margin = 0) {
+  const rx = Math.max(0.2, lobe.rx + margin);
+  const rz = Math.max(0.2, lobe.rz + margin);
+  const dx = point.x - island.group.position.x - lobe.x;
+  const dz = point.z - island.group.position.z - lobe.z;
+  const rot = lobe.rot || 0;
+  const cosIn = Math.cos(-rot);
+  const sinIn = Math.sin(-rot);
+  let localX = dx * cosIn - dz * sinIn;
+  let localZ = dx * sinIn + dz * cosIn;
+  let normalized = (localX * localX) / (rx * rx) + (localZ * localZ) / (rz * rz);
+  if (normalized >= 1) return null;
+  if (normalized < 0.000001) {
+    localX = 0;
+    localZ = rz * 0.05;
+    normalized = (localZ * localZ) / (rz * rz);
+  }
+  const scale = 1 / Math.sqrt(normalized);
+  const boundaryX = localX * scale;
+  const boundaryZ = localZ * scale;
+  const cosOut = Math.cos(rot);
+  const sinOut = Math.sin(rot);
+  const x = island.group.position.x + lobe.x + boundaryX * cosOut - boundaryZ * sinOut;
+  const z = island.group.position.z + lobe.z + boundaryX * sinOut + boundaryZ * cosOut;
+  const normal = new THREE.Vector3(x - point.x, 0, z - point.z);
+  const correction = normal.length();
+  if (correction <= 0.0001) return null;
+  normal.multiplyScalar(1 / correction);
+  return { x, z, normal, correction };
+}
+
 function islandDockPointRadius(island) {
   if (!island) return 0;
   const shipPadding = state.mode === "ship" ? shipCollisionRadius(state.shipType) * 0.35 : 0;
@@ -5716,12 +5751,12 @@ function islandDockPointRadius(island) {
 function islandDockShoreMargin(island) {
   if (!island) return 0;
   if (island.exploreOnly) {
-    const shipPadding = state.mode === "ship" ? shipCollisionRadius(state.shipType) * 0.52 : 0;
+    const shipPadding = state.mode === "ship" ? islandShipContactMargin(state.shipType, 4.5) : 0;
     return state.mode === "ship"
-      ? clamp(island.radius * 0.08 + shipPadding + 2.2, 4.2, 10.5)
+      ? clamp(island.radius * 0.05 + shipPadding + 2.5, 7.5, 16)
       : 1.8;
   }
-  return state.mode === "ship" ? 12 : 2;
+  return state.mode === "ship" ? Math.max(12, islandShipContactMargin(state.shipType, 5.5)) : 2;
 }
 
 function islandDockContains(island, point) {
@@ -7146,9 +7181,29 @@ function applyRamDamage(a, b) {
 }
 
 function pushShipOutOfIslands(position, shipType, velocity = null, padding = 4) {
-  const radius = shipCollisionRadius(shipType) * 0.62 + padding;
+  const radius = islandShipContactMargin(shipType, padding);
   let pushed = false;
   islands.forEach((island) => {
+    if (island.surfaceLobes?.length) {
+      for (let pass = 0; pass < 2; pass++) {
+        let moved = false;
+        island.surfaceLobes.forEach((lobe) => {
+          const push = islandLobePushout(island, lobe, position, radius);
+          if (!push) return;
+          position.x = push.x;
+          position.z = push.z;
+          if (velocity) {
+            const inward = velocity.dot(push.normal);
+            if (inward < 0) velocity.add(push.normal.clone().multiplyScalar(-inward * 1.05));
+            velocity.multiplyScalar(0.62);
+          }
+          moved = true;
+          pushed = true;
+        });
+        if (!moved) break;
+      }
+      return;
+    }
     const dx = position.x - island.group.position.x;
     const dz = position.z - island.group.position.z;
     const distance = Math.hypot(dx, dz);
@@ -12603,22 +12658,8 @@ function dockAtIsland(island) {
 function setSail() {
   if (state.mode !== "land") return;
   if (state.dockedAt === "Forge") return toast("Use the waterfall to leave the Forge.");
-  const island = islands.find((item) => item.name === state.dockedAt) || currentIsland();
   closeShop();
   ["w", "a", "s", "d", "c"].forEach((key) => keys.delete(key));
-  if (island) {
-    const away = playerShip.position.clone().sub(island.group.position);
-    away.y = 0;
-    if (away.lengthSq() < 0.001) {
-      away.set(Math.sin(character.rotation.y), 0, Math.cos(character.rotation.y));
-    }
-    away.normalize();
-    const minDistance = island.radius + shipHitRadius(state.shipType) + 2.5;
-    if (dist2(playerShip.position, island.group.position) < minDistance) {
-      playerShip.position.x = island.group.position.x + away.x * minDistance;
-      playerShip.position.z = island.group.position.z + away.z * minDistance;
-    }
-  }
   state.mode = "ship";
   state.viewMode = "ship";
   state.dockedAt = null;
